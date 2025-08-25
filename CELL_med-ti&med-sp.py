@@ -1,0 +1,808 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import queue
+import timeit
+import time
+import pandas as pd
+import os
+import os.path
+#C: list of three numbers: dimensions of cell
+#G: list of three numbers: widths of the spaces around the cell
+#N: list of three numbers: number of blocks along each dimension
+
+#*** for the above three inputs, the middle  entry of the list is for the longitudinal direction***
+#*** make sure that C[0]/N[0] = C[1]/N[1] = C[2]/N[2]***
+
+#ionThresh: number: adjusts how repellent the number of ions in the destination is: the lower
+#      this number is the lower the number of ions in the destination will make the move score
+#openThresh: list of two numbers: the threshold for a GAP boundary block (first) and the threshold
+#      for a MARG boundary block (second); the higher these numbers are the easier it is for the face of
+#      the cell boundary touching that GAP/MARG block is to go from closed to ope
+#cellType: string that is either 'leftend', 'middle', or 'rightend': determines whether the cell being
+#      made is the left most cell, the rightmost cell, or one of the cells in the middle
+#ionChans: list of two numbers: the number of ion channels in a face of the cell boundary for a
+#      GAP block (first) or a MARG block (second). The lower this number is the more difficult it is
+#      for an ion to cross the open boundary of this region into the cell
+
+#***when comparing the performance of different distributions of ion channels, try to make it so 
+#   total number of ion channels around the entire cell remains constant.***
+
+#gapJunct: number between 0 and 1 (inclusive): coefficient simulating how easy it is for ions to jump
+#from one cell to another; the lower this number the more difficult it is
+
+#NiGAP: number: the number of ions that start in a GAP (one entire end of a cell); as default we start
+#      with 80 ions, with each model ion representing about 10^7 ions in nature
+#NiMARG: number: the number of ions that start ina MARG (one entire longitudinal side of a cell); as
+#      default we start with 4200 ions, with each model ion representing about 10^7 ions in nature
+
+#moveFilter: number between 0 and 1: represents the expected number of ions that we will choose to move
+#      each timestep
+#      cell boundary in the leftmost cell; if False it will be in the GAP, if True in the MARG; generally
+#      the only time we set this to be True is when ionChans[0] = 0, that is there are no ion channels
+#      on a face of the cell boundary facing a GAP block (since then opening the boundary there does nothing
+#      as ions still can't cross over)
+
+#pokeHoleMARG: Boolean: determines where to start the depolarization process by opening a region of the
+#      cell boundary in the leftmost cell; if False it will be in the GAP, if True in the MARG; generally
+#      the only time we set this to be True is when ionChans[0] = 0, that is there are no ion channels
+#      on a face of the cell boundary facing a GAP block (since then opening the boundary there does nothing
+#      as ions still can't cross over)
+
+class Cell:
+ 
+    def __init__(self,C, G, N, ionThresh, openThresh, cellType, ionChans, gapJunct = 0.1, NiGAP = 800, NiMARG = 42000,\
+                moveFilter = 0.2, pokeHoleMARG = False):
+
+        self.C = C
+        self.G = G
+        self.N = N
+
+        #warning to make sure parameters satisfy certain equalities. See NOTE above the instantiation of
+        #self.DimGAP et al. below.
+        if C[0]/N[0] != C[1]/N[1] or C[0]/N[0] != C[2]/N[2] or C[1]/N[1]!=C[2]/N[2] or G[0] != G[2]:
+            print('Warning: The model assumes equal ratios of C[i]/N[i], i = 1,2,3, and that G[0] = G[2].'+\
+                  'If these values do not match the model may not give out the correct result.')
+        
+        #
+        self.moveFilter = moveFilter
+        
+        self.DimINTRA = [C[0]/N[0],C[1]/N[1],C[2]/N[2]]
+        #dimensions of a GAP box
+        self.DimGAP = [C[0]/N[0],G[1],C[2]/N[2]]
+        self.DimMARG = [G[0],C[1]/N[1],C[2]/N[2]]
+
+        #surface areas of the boxes 
+        self.INTRA_SA = self.SurfArea(self.DimINTRA)
+        self.GAP_SA = self.SurfArea(self.DimGAP)
+        self.MARG_SA = self.SurfArea(self.DimMARG)
+
+        #volumes of squares
+        self.INTRA_VOL = self.Volu(self.DimINTRA)
+        self.GAP_VOL = self.Volu(self.DimGAP)
+        self.MARG_VOL =  self.Volu(self.DimMARG)
+
+        #use INTRA because in both cases the interface is a face of an INTRA block
+        #self.GAPchanCoeff = ionChans[0]/(self.INTRA_SA/6)
+        #self.MARGINchanCoeff = ionChans[1]/(self.INTRA_SA/6)
+
+        #actually, make it so that the channel coefficients start at 0 and approach
+        #1 as the number of ion channels per region increases
+        #Note: don't have to use ion channel density on a face since all faces involving
+        #ion channels are faces of INTRA blocks. In other words, the number of ion channels
+        #completely determines the ion channel density.
+        self.GAPchanCoeff = 1-np.exp(-ionChans[0])
+        self.MARGINchanCoeff = 1-np.exp(-ionChans[1])
+        self.CellCellchanCoeff = gapJunct
+
+        #the order of the destination square in each list is: STAY, INTRA, MARG, GAP
+        #self.INTRA = np.array([self.computeStay(self.INTRA_VOL,self.INTRA_SA),self.DimINTRA[0]*self.DimINTRA[1],0,0])
+        #self.GAP = np.array([self.computeStay(self.GAP_VOL,self.GAP_SA),self.DimGAP[0]*self.DimGAP[2],\
+                            #self.DimGAP[0]*self.DimGAP[1], self.DimGAP[0]*self.DimGAP[1]])
+        #self.MARG = np.array([self.computeStay(self.MARG_VOL,self.MARG_SA),self.DimMARG[1]*self.DimMARG[2],\
+                            #self.DimMARG[0]*self.DimMARG[1],self.DimGAP[1]*self.DimGAP[2]])
+
+        self.INTRA = np.array([self.computeStay(self.INTRA_VOL,self.INTRA_SA),(self.DimINTRA[0]*self.DimINTRA[1])/self.INTRA_SA,0,0])
+
+        self.GAP = np.array([self.computeStay(self.GAP_VOL,self.GAP_SA),(self.DimGAP[0]*self.DimGAP[2])/self.GAP_SA,\
+                            (self.DimGAP[0]*self.DimGAP[1])/self.GAP_SA, (self.DimGAP[0]*self.DimGAP[1])/self.GAP_SA])
+
+        self.MARG = np.array([self.computeStay(self.MARG_VOL,self.MARG_SA),(self.DimMARG[1]*self.DimMARG[2])/self.MARG_SA,\
+                            (self.DimMARG[0]*self.DimMARG[1])/self.MARG_SA,(self.DimGAP[1]*self.DimGAP[2])/self.MARG_SA])
+        
+        self.NiGAP = NiGAP
+        self.NiMARG = NiMARG
+
+
+        #CellType; whether the cell is 'leftend', 'middle', or 'rightend'
+        self.cellType = cellType
+
+        #this is the minimum number of ions in a grid square to block an ion
+        #from moving in there
+        self.ionThresh = ionThresh
+
+
+        self.GAP_Thresh = openThresh[0]
+        self.MARG_Thresh = openThresh[1]
+
+        #new variable lists
+        self.current_list = []
+        self.pv_list = []
+        self.pvpv_list = []
+        
+        #initialize ions to the left of the cell (this is GAP)
+        ionDownUp = np.random.uniform(self.G[0],self.G[0]+self.C[0],self.NiGAP)
+        ionLeftRight = np.array([0.5*self.G[1] for i in range(self.NiGAP)])
+        ionOutIn = np.random.uniform(self.G[2],self.G[2]+self.C[2],self.NiGAP)
+
+        #initialize the ions above the cell (this is MARG)
+        ionDownUp = np.concatenate((ionDownUp,np.array([self.C[0]+1.5*self.G[0] for i in range(self.NiMARG)])),axis = None)
+        ionLeftRight = np.concatenate((ionLeftRight, np.random.uniform(self.G[1],self.G[1]+self.C[1],self.NiMARG)),axis = None)
+        ionOutIn = np.concatenate((ionOutIn,np.random.uniform(self.G[2],self.G[2]+self.C[2],self.NiMARG)),axis = None)
+        
+        #initalize the ions below the cell (this is MARG)
+        ionDownUp = np.concatenate((ionDownUp,np.array([0.5*self.G[0] for i in range(self.NiMARG)])),axis = None)
+        ionLeftRight = np.concatenate((ionLeftRight, np.random.uniform(self.G[1],self.G[1]+self.C[1],self.NiMARG)),axis = None)
+        ionOutIn = np.concatenate((ionOutIn,np.random.uniform(self.G[2],self.G[2]+self.C[2],self.NiMARG)),axis = None)
+
+        #initialize the ions out in front of the cell (this is MARG)
+        ionDownUp = np.concatenate((ionDownUp,np.random.uniform(self.G[0],self.G[0]+self.C[0],self.NiMARG)),axis = None)
+        ionLeftRight = np.concatenate((ionLeftRight, np.random.uniform(self.G[1],self.G[1]+self.C[1],self.NiMARG)),axis = None)
+        ionOutIn = np.concatenate((ionOutIn,np.array([self.C[2]+1.5*self.G[2] for i in range(self.NiMARG)])),axis = None)
+
+        #initialize the ions behind the cell (this is MARG)
+        ionDownUp = np.concatenate((ionDownUp,np.random.uniform(self.G[0],self.G[0]+self.C[0],self.NiMARG)),axis = None)
+        ionLeftRight = np.concatenate((ionLeftRight, np.random.uniform(self.G[1],self.G[1]+self.C[1],self.NiMARG)),axis = None)
+        ionOutIn = np.concatenate((ionOutIn,np.array([0.5*self.G[2] for i in range(self.NiMARG)])),axis = None)
+
+
+        #October 2, 2024: Keep the bndOpen matrix as Ny+2 x Nx+2; just remember that when checking
+        #bndOpen of the final column we will use ionMat[:,0] of the next cell
+        self.bndOpen = np.zeros((self.N[0]+2,self.N[1]+2,self.N[2]+2))
+        #September 12, 2024: poke a hole in the boundary if it's 'leftend'
+        if self.cellType == 'leftend':
+            if pokeHoleMARG:
+                #poke a hole on the margin instead
+                self.bndOpen[0,1,np.ceil(N[2]/2).astype(int)]=1
+            else:
+                self.bndOpen[np.ceil(N[0]/2).astype(int),0,np.ceil(N[2]/2).astype(int)]=1
+            
+            
+        self.bndOpen = self.bndOpen.astype(int)
+    
+        if cellType == 'rightend':
+            #initialize the ions to the right of the cell
+            ionDownUp = np.concatenate((ionDownUp,np.random.uniform(self.G[0],self.G[0]+self.C[0],self.NiGAP)),axis = None)
+            ionLeftRight = np.concatenate((ionLeftRight,np.array([self.C[1]+1.5*self.G[1] for i in range(self.NiGAP)])),axis = None)
+            ionOutIn = np.concatenate((ionOutIn,np.random.uniform(self.G[2],self.G[2]+self.C[2],self.NiGAP)),axis = None)
+        else:
+            pass
+        
+        #counts how many times we've moved the ions
+        self.counter = 0
+        #set equal to self.counter once we first meet the depolarization criterion
+        self.depolar = 0
+        #an array that will count how many ions traveled using the gap junction to the righthand cell
+        self.jumpJunct = []
+        #array that will count how many ions entered through the GAP
+        self.enterGAPself = []
+        #array that will count how many ions entered through the GAP into the cell on the left
+        self.enterGAPleft = []
+        #array that will count how many ions entered through MARG
+        self.enterMARG = []
+
+        #note: self.DimINTRA = [C[0]/N[0], C[1]/N[1], C[2]/N[2]]
+        self.ionDU = (np.maximum(np.minimum(np.ceil((ionDownUp-self.G[0])/self.DimINTRA[0]),self.N[0]),1)).astype(int)
+        self.ionLR = (np.maximum(np.minimum(np.ceil((ionLeftRight-self.G[1])/self.DimINTRA[1]),self.N[1]),1)).astype(int)
+        self.ionOI = (np.maximum(np.minimum(np.ceil((ionOutIn-self.G[2])/self.DimINTRA[2]),self.N[2]),1)).astype(int)
+
+
+        self.ionDU[ionDownUp < self.G[0]] = 0
+        self.ionDU[ionDownUp > self.C[0]+self.G[0]] = self.N[0]+1
+        self.ionLR[ionLeftRight < self.G[1]] = 0
+        if self.cellType == 'rightend':
+            self.ionLR[ionLeftRight > self.C[1]+self.G[1]] = self.N[1]+1
+        self.ionOI[ionOutIn < self.G[2]] = 0
+        self.ionOI[ionOutIn > self.C[2]+self.G[2]] = self.N[2]+1
+    
+        #initialize ion-grid matrix like in getionCount()
+        #October 2, 2024: we get rid of the last column 
+        if self.cellType == 'rightend':
+            self.ionMat = np.zeros((self.N[0]+2,self.N[1]+2,self.N[2]+2))
+        else:
+            self.ionMat = np.zeros((self.N[0]+2,self.N[1]+1,self.N[2]+2))
+        for k in range(len(self.ionDU)):
+            self.ionMat[self.ionDU[k],self.ionLR[k],self.ionOI[k]] += 1
+        self.ionMat = self.ionMat.astype(int)
+
+    #compute the surface area of a box from its dimensions; helper function
+    #for __init__ above
+    def SurfArea(self,dims):
+        return 2*(dims[0]*dims[1]+dims[0]*dims[2]+dims[1]*dims[2])
+
+    #computes the volume of a box from its dimensions; helper function 
+    #for __init__ above
+    def Volu(self,dims):
+        return dims[0]*dims[1]*dims[2]
+
+    #this is for determining the STAY version of the cross-section coefficient;
+    #in case we want to change it up from Volume/SurfaceArea (which is 3-dim divided by 2-dim)
+    def computeStay(self,Vol,SurfArea):
+        #original
+        #return Vol/SurfArea
+        return np.cbrt(Vol)/np.sqrt(SurfArea)
+    
+    #determine the square the ion is in
+    def boxType(self,currDU,currLR,currOI):
+        if (currDU==0 or currDU==self.N[0]+1) and  currLR>=1 and currLR<=self.N[1] and currOI>=1 and currOI<=self.N[2]:
+            return -2
+        elif (currLR==0 or currLR==self.N[1]+1) and  currDU>=1 and currDU<=self.N[0] and currOI>=1 and currOI<=self.N[2]:
+            return -1
+        elif (currOI==0 or currOI==self.N[2]+1) and  currDU>=1 and currDU<=self.N[0] and currLR>=1 and currLR<=self.N[1]:
+            return -2
+        elif currDU>=1 and currLR>=1 and currOI>=1 and currDU<=self.N[0] and currLR<=self.N[1] and currOI<=self.N[2]:
+
+            return -3
+        else:
+            print('Invalid square for ion: ('+ str(currI)+', '+str(currJ)+')')
+            return 0
+    
+    #for each grid square, count the number of ions in that square
+    #used for newPos function, to determine if a grid square has too many ions
+    #to accept new members
+    def getionCount(self):
+        if self.cellType == 'rightend':
+            self.ionMat = np.zeros((self.N[0]+2,self.N[1]+2,self.N[2]+2))
+        else:
+            self.ionMat = np.zeros((self.N[0]+2,self.N[1]+1,self.N[2]+2))
+        for k in range(len(self.ionDU)):
+            self.ionMat[self.ionDU[k],self.ionLR[k],self.ionOI[k]] += 1
+        self.ionMat = self.ionMat.astype(int)
+  
+    def getAvail(self, tempIon, leftNbhr=0, rightNbhr = 0):
+
+        colZeros = np.zeros(tempIon.shape[1])
+        colOnes = np.ones(tempIon.shape[1])
+
+        colN0s = np.array(tempIon.shape[1]*[self.N[0]])
+        colN1s = np.array(tempIon.shape[1]*[self.N[1]])
+        colN2s = np.array(tempIon.shape[1]*[self.N[2]])
+        codeI = np.array(tempIon.shape[1]*[-4])
+        codeS = np.array(tempIon.shape[1]*[-1])
+        codeR = np.array(tempIon.shape[1]*[-3])
+        codeL = np.array(tempIon.shape[1]*[-2])
+        
+        DOWN =  [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[0] == 0)+\
+                (tempIon[0] == 1)*(\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[1]>= 1) & (tempIon[1] <= self.N[1]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                    ((tempIon[1] ==0) | (tempIon[1] == self.N[1]+1))*(\
+                        [codeS,colZeros,colOnes,tempIon[2]]*((self.cellType == 'leftend') & (tempIon[1] ==0))+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        #DOUBLE TROUBLE
+                        [codeS,colZeros,colOnes,tempIon[2]]*((self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                        #move this one below to the EXTRAs
+                        #[codeL,colZeros,colN1s,tempIon[2]]*(self.cellType != 'leftend' and tempIon[1] == 0)+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        [codeS,colZeros,colN1s,tempIon[2]]*((self.cellType == 'rightend') & (tempIon[1] == self.N[1]+1)))+\
+                    [codeS,colZeros,tempIon[1],colOnes]*(tempIon[2]==0)+\
+                    [codeS,colZeros,tempIon[1],colN2s]*(tempIon[2] == self.N[2]+1))+\
+                (tempIon[0] == self.N[0]+1)*(\
+                    [codeS,tempIon[0]-1,tempIon[1],tempIon[2]]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~((self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1))))+\
+                [codeS,tempIon[0]-1,tempIon[1],tempIon[2]]*(~(((tempIon[0] == 0) | (tempIon[0] == 1) | (tempIon[0] == self.N[0]+1))))
+
+
+        UP =    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                (tempIon[0] == self.N[0])*(\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[1]>= 1) & (tempIon[1] <= self.N[1]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                    ((tempIon[1] ==0) | (tempIon[1] == self.N[1]+1))*(\
+                        [codeS,colN0s+1,colOnes,tempIon[2]]*((self.cellType== 'leftend') & (tempIon[1] ==0))+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        #DOUBLE TROUBLE
+                        [codeS,colN0s+1,colOnes,tempIon[2]]*((self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                        #move this one below to the EXTRAs
+                        #[codeL,colN0s+1,colN1s,tempIon[2]]*(self.cellType != 'leftend' and tempIon[1] == 0)+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        [codeS,colN0s+1,colN1s,tempIon[2]]*((self.cellType == 'rightend') & (tempIon[1] == self.N[1]+1)))+\
+                    [codeS,colN0s+1,tempIon[1],colOnes]*(tempIon[2] ==0)+\
+                    [codeS,colN0s+1,tempIon[1],colN2s]*(tempIon[2] == self.N[2]+1))+\
+                (tempIon[0] == 0)*(\
+                    [codeS,tempIon[0]+1,tempIon[1],tempIon[2]]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                [codeS,tempIon[0]+1,tempIon[1],tempIon[2]]*(~((tempIon[0] == self.N[0]+1) | (tempIon[0] == self.N[0]) | (tempIon[0] == 0))) 
+
+
+        IN =    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[2] == 0)+\
+                (tempIon[2] == 1)*(\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[1]>= 1) & (tempIon[1] <= self.N[1]) & (tempIon[0]>=1) & (tempIon[0]<=self.N[0]))+\
+                    ((tempIon[1] ==0) | (tempIon[1] == self.N[1]+1))*(\
+                        [codeS,tempIon[0],colOnes,colZeros]*((self.cellType== 'leftend') & (tempIon[1] ==0))+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        #DOUBLE TROUBLE
+                        [codeS,tempIon[0],colOnes,colZeros]*((self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                        #move this one below to the EXTRAs
+                        #[codeL,tempIon[0],colN1s,colZeros]*(self.cellType != 'leftend' and tempIon[1] == 0)+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        [codeS,tempIon[0],colN1s,colZeros]*((self.cellType == 'rightend') & (tempIon[1] == self.N[1]+1)))+\
+                    [codeS,colOnes,tempIon[1],colZeros]*(tempIon[0] ==0)+\
+                    [codeS,colN0s,tempIon[1],colZeros]*(tempIon[0] == self.N[0]+1))+\
+                (tempIon[2] == self.N[2]+1)*(\
+                    [codeS,tempIon[0],tempIon[1],tempIon[2]-1]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                [codeS,tempIon[0],tempIon[1],tempIon[2]-1]*(~((tempIon[2] == 0) | (tempIon[2] == 1) | (tempIon[2] == self.N[2]+1)))
+          
+        OUT =   [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[2] == self.N[2]+1)+\
+                (tempIon[2] == self.N[2])*(\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[1]>= 1) & (tempIon[1] <= self.N[1]) & (tempIon[0]>=1) & (tempIon[0]<=self.N[0]))+\
+                    ((tempIon[1] ==0) | (tempIon[1] == self.N[1]+1))*(\
+                        [codeS,tempIon[0],colOnes,colN2s+1]*((self.cellType== 'leftend') & (tempIon[1] ==0))+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        #DOUBLE TROUBLE
+                        [codeS,tempIon[0],colOnes,colN2s+1]*((self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                        #move this one below to the EXTRAs
+                        #[codeL,tempIon[0],colN1s,colN2s+1]*(self.cellType != 'leftend' and tempIon[1] == 0)+\
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        [codeS,tempIon[0],colN1s,colN2s+1]*((self.cellType == 'rightend') & (tempIon[1] == self.N[1]+1)))+\
+                    [codeS,colOnes,tempIon[1],colN2s+1]*(tempIon[0] ==0)+\
+                    [codeS,colN0s,tempIon[1],colN2s+1]*(tempIon[0] == self.N[0]+1))+\
+                (tempIon[2] == 0)*(\
+                    [codeS,tempIon[0],tempIon[1],tempIon[2]+1]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                [codeS,tempIon[0],tempIon[1],tempIon[2]+1]*(~((tempIon[2] == self.N[2]+1) | (tempIon[2] == self.N[2]) | (tempIon[2] == 0)))
+
+
+        RIGHT = [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[1] == self.N[1]+1)+\
+                (tempIon[1] == self.N[1])*(\
+                    (self.cellType == 'rightend')*(\
+                        [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[0]>=1) & (tempIon[0]<=self.N[0]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                        [codeS,colOnes,colN1s+1,tempIon[2]]*(tempIon[0] ==0)+\
+                        [codeS,colN0s,colN1s+1,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                        [codeS,tempIon[0],colN1s+1,colOnes]*(tempIon[2] ==0)+\
+                        [codeS,tempIon[0],colN1s+1,colN2s]*(tempIon[2] == self.N[2]+1))+\
+                    (self.cellType!='rightend')*(\
+                        [codeR,tempIon[0],colOnes,tempIon[2]]*((tempIon[0]>=1) & (tempIon[0]<=self.N[0]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                        [codeR,colOnes,colZeros,tempIon[2]]*(tempIon[0] ==0)+\
+                        [codeR,colN0s,colZeros,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                        [codeR,tempIon[0],colZeros,colOnes]*(tempIon[2] ==0)+\
+                        [codeR,tempIon[0],colZeros,colN2s]*(tempIon[2] == self.N[2]+1)))+\
+                (tempIon[1] == 0)*(\
+                    [codeS,tempIon[0],tempIon[1]+1,tempIon[2]]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                [codeS,tempIon[0],tempIon[1]+1,tempIon[2]]*(~((tempIon[1] == self.N[1]+1) | (tempIon[1] == self.N[1]) | (tempIon[1] == 0)))     
+
+        if  self.cellType == 'leftend':
+            LEFT = (tempIon[1] == 0)*(\
+                    #include tempIon[1]==tempIon[1] tautology to create an array
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(tempIon[1]==tempIon[1]))+\
+                (tempIon[1] == 1)*(\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*((tempIon[0]>=1) & (tempIon[0]<=self.N[0]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                    [codeS,colOnes,colZeros,tempIon[2]]*(tempIon[0] ==0)+\
+                    [codeS,colN0s,colZeros,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                    [codeS,tempIon[0],colZeros,colOnes]*(tempIon[2] ==0)+\
+                    [codeS,tempIon[0],colZeros,colN2s]*(tempIon[2] == self.N[2]+1))+\
+                (tempIon[1] == self.N[1]+1)*(\
+                    [codeS,tempIon[0],tempIon[1]-1,tempIon[2]]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                    [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                [codeS,tempIon[0],tempIon[1]-1,tempIon[2]]*(~((tempIon[1] == 0) | (tempIon[1] == 1) | (tempIon[1] == self.N[1]+1)))  
+
+        #have to separate the cases for when the cell is or isn't 'leftend', since it can't call leftNbhr when it is 'leftend'
+        else:
+            LEFT =  (tempIon[1] == 0)*(\
+                        [codeL,tempIon[0],colN1s,tempIon[2]]*(leftNbhr.bndOpen[tempIon[0],colN1s+1,tempIon[2]] == 1)+\
+                        [codeI,tempIon[0],tempIon[1],tempIon[2]]*(leftNbhr.bndOpen[tempIon[0],colN1s+1,tempIon[2]] != 1))+\
+                    (tempIon[1] == 1)*(\
+                        [codeL,tempIon[0],colN1s,tempIon[2]]*((tempIon[0]>=1) & (tempIon[0]<=self.N[0]) & (tempIon[2]>=1) & (tempIon[2]<=self.N[2]))+\
+                        [codeS,colOnes,colZeros,tempIon[2]]*(tempIon[0] ==0)+\
+                        [codeS,colN0s,colZeros,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                        [codeS,tempIon[0],colZeros,colOnes]*(tempIon[2] ==0)+\
+                        [codeS,tempIon[0],colZeros,colN2s]*(tempIon[2] == self.N[2]+1))+\
+                    (tempIon[1] == self.N[1]+1)*(\
+                        [codeS,tempIon[0],tempIon[1]-1,tempIon[2]]*(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)+\
+                        [codeI,tempIon[0],tempIon[1],tempIon[2]]*(~(self.bndOpen[tempIon[0],tempIon[1],tempIon[2]] ==1)))+\
+                    [codeS,tempIon[0],tempIon[1]-1,tempIon[2]]*(~((tempIon[1] == 0) | (tempIon[1] == 1) | (tempIon[1] == self.N[1]+1)))  
+
+        EXTRA = [codeL,colZeros,colN1s,tempIon[2]]*((tempIon[0] == 1) & (self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                [codeL,colN0s+1,colN1s,tempIon[2]]*((tempIon[0] == self.N[0]) & (self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                (tempIon[1] == self.N[1])*(\
+                    (self.cellType!='rightend')*(\
+                        [codeR,colZeros,colOnes,tempIon[2]]*(tempIon[0] ==0)+\
+                        [codeR,colN0s+1,colOnes,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                        [codeR,tempIon[0],colOnes,colZeros]*(tempIon[2] ==0)+\
+                        [codeR,tempIon[0],colOnes,colN2s+1]*(tempIon[2] == self.N[2]+1)))+\
+                (tempIon[1] == 1)*(\
+                    (self.cellType != 'leftend')*(\
+                        [codeL,colZeros,colN1s,tempIon[2]]*(tempIon[0] ==0)+\
+                        [codeL,colN0s+1,colN1s,tempIon[2]]*(tempIon[0] == self.N[0]+1)+\
+                        [codeL,tempIon[0],colN1s,colZeros]*(tempIon[2] ==0)+\
+                        [codeL,tempIon[0],colN1s,colN2s+1]*(tempIon[2] == self.N[2]+1)))+\
+                [codeI, tempIon[0],tempIon[1],tempIon[2]]*(~(((tempIon[0] == 1) & (self.cellType != 'leftend') & (tempIon[1] == 0)) | \
+                                                              ((tempIon[0] == self.N[0]) & (self.cellType != 'leftend') & (tempIon[1] == 0)) |\
+                                                              ((tempIon[1] == self.N[1]) & (self.cellType!='rightend') & \
+                                                              ((tempIon[0]==0) | (tempIon[0]==self.N[0]+1) | (tempIon[2]==0) | (tempIon[2] == self.N[2]+1))) |\
+                                                              ((tempIon[1] == 1) & (self.cellType != 'leftend') & \
+                                                              ((tempIon[0]==0) | (tempIon[0]==self.N[0]+1) | (tempIon[2]==0) | (tempIon[2] == self.N[2]+1))))) 
+                        
+        EXTRA2 = [codeL,tempIon[0],colN1s,colZeros]*((tempIon[2] == 1) & (self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                [codeL,tempIon[0],colN1s,colN2s+1]*((tempIon[2] == self.N[2]) & (self.cellType != 'leftend') & (tempIon[1] == 0))+\
+                [codeI, tempIon[0],tempIon[1],tempIon[2]]*(~(((tempIon[2] == 1) & (self.cellType != 'leftend') & (tempIon[1] == 0))\
+                                                              | ((tempIon[2] == self.N[2]) & (self.cellType != 'leftend') & (tempIon[1] == 0))))
+        
+        return np.array(UP), np.array(DOWN), np.array(IN), np.array(OUT), np.array(RIGHT), np.array(LEFT),\
+            np.array(EXTRA), np.array(EXTRA2)
+                    
+    #March 5, 2025: optimize; make it so that the inputs are as follows: esp play with 
+    def computeMoveScore(self, current, destination,lN,rN,colCats,stay):
+        
+        if self.cellType == 'leftend':
+            ionCount = (destination[0,:] == -3)*(rN.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])+\
+                   ((destination[0,:] != -3) & (destination[0,:]!=-2))*(self.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])
+        elif self.cellType == 'rightend':
+            #include the np.min for the case where the block is in RL coordinate 14, which in lN doesn't exist since it has only thirteen blocks RL-wise, not 14
+             ionCount = (destination[0,:] == -2)*(lN.ionMat[destination[1,:].astype(int),np.fmin(destination[2,:].astype(int),12),destination[3,:].astype(int)])+\
+                   ((destination[0,:] != -3) & (destination[0,:]!=-2))*(self.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])
+        else:
+            ionCount = (destination[0,:] == -2)*(lN.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])+\
+                   (destination[0,:] == -3)*(rN.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])+\
+                   ((destination[0,:] != -3) & (destination[0,:]!=-2))*(self.ionMat[destination[1,:].astype(int),destination[2,:].astype(int),destination[3,:].astype(int)])
+        
+        currSquare = colCats[0]*((current[1] == 0) | ((current[1] == self.N[1]+1) & (self.cellType == 'rightend')))+\
+                    colCats[1]*((current[0] == 0) | (current [0] == self.N[0]+1) | (current[2] == 0) | (current[2] == self.N[2]+1))+\
+                    colCats[2]*(~((current[0] == 0) | (current [0] == self.N[0]+1) | (current[1] == 0)\
+                                | ((current[1] == self.N[1]+1) & (self.cellType=='rightend'))\
+                                | (current[2] == 0) | (current[2] == self.N[2]+1)))
+
+        destSquare = colCats[3]*((destination[1] == current[0]) & (destination[2]==current[1]) & (destination[3] == current[2]))+\
+                    (~((destination[1] == current[0]) & (destination[2]==current[1]) & (destination[3] == current[2])))*(\
+                        colCats[0]*((destination[2] == 0)  | ((destination[2] == self.N[1]+1) & (self.cellType == 'rightend')))+\
+                        colCats[1]*((destination[1] == 0) | (destination [1] == self.N[0]+1) | (destination[3] == 0) | (destination[3] == self.N[2]+1))+\
+                        colCats[2]*(~((destination[1] == 0) | (destination[1] == self.N[0]+1) | (destination[2] == 0) |\
+                                  ((destination[2] == self.N[1]+1) & (self.cellType=='rightend'))\
+                                | (destination[3] == 0) | (destination[3] == self.N[2]+1)\
+                                | ((destination[1] == current[0]) & (destination[2]==current[1]) & (destination[3] == current[2])))))
+
+        #May 12, 2025: implement checking to see if this is a ion channel-moderated
+        #jump, and include multiplication by appropriate channel coefficient
+        chanCoef = self.GAPchanCoeff*((currSquare == -1) & (destSquare == -3))+\
+            self.MARGINchanCoeff*((currSquare == -2) & (destSquare == -3))+\
+            self.CellCellchanCoeff*((currSquare == -3) & (destSquare == -3) & (destination[0] !=-1))+\
+            +1*(~(((currSquare == -1) & (destSquare == -3)) |\
+                    ((currSquare == -2) & (destSquare == -3)) |\
+                    ((currSquare == -3) & (destSquare == -3) & (destination[0]!=-1))))
+        
+        #rewrite the volume of the destination square as a formula
+        destVol = (destSquare == -2)*self.MARG_VOL+(destSquare == -1)*self.GAP_VOL+(destSquare == -2)*self.MARG_VOL+\
+            (destSquare == -3)*self.INTRA_VOL+\
+            (destSquare == -4)*((currSquare == -2)*self.MARG_VOL+(currSquare == -1)*self.GAP_VOL+(currSquare == -2)*self.MARG_VOL+\
+            (currSquare == -3)*self.INTRA_VOL)
+
+        csCoef = (currSquare == -2)*self.MARG[destSquare]+\
+            (currSquare == -1)*self.GAP[destSquare]+\
+            (currSquare == -3)*self.INTRA[destSquare]
+        
+        return (destination[0]!=-4)*chanCoef*csCoef/(1+np.exp(((ionCount**3)/np.sqrt(destVol))-self.ionThresh))
+        #return csCoef/(1+np.exp(ionCount-self.ionThresh))
+
+    def computeJump(self,tempIon, lN =0, rN = 0,show = False,timeRun = False):
+        #get it so that adjs is a list of dictionaries of available blocks for each ion
+        if timeRun:
+            tgetavail0 = time.time()
+        UP, DOWN, IN, OUT, RIGHT, LEFT, EXTRA, EXTRA2 = self.getAvail(tempIon,leftNbhr = lN,rightNbhr = rN)           
+        if timeRun:
+            tgetavail1 = time.time()
+            print('Time to run getAvail is')
+            print(tgetavail1-tgetavail0)
+        
+        colGAPs = np.array(tempIon.shape[1]*[-1])
+        colMARGs = np.array(tempIon.shape[1]*[-2])
+        colINTRAs = np.array(tempIon.shape[1]*[-3])
+        colSTAYs = np.array(tempIon.shape[1]*[-4])
+        colCats = [colGAPs, colMARGs, colINTRAs, colSTAYs]
+
+        moveScores = np.zeros((9,tempIon.shape[1]))
+        tempIonDest = np.vstack((np.array(tempIon.shape[1]*[-1]),tempIon))
+
+        if timeRun:
+            tcompMove0 = time.time()
+        moveScores[0,:] = self.computeMoveScore(tempIon,UP,lN,rN,colCats,stay = False)
+        moveScores[1,:] = self.computeMoveScore(tempIon,DOWN,lN,rN,colCats,stay = False)
+        moveScores[2,:] = self.computeMoveScore(tempIon,OUT,lN,rN,colCats, stay = False)
+        moveScores[3,:] = self.computeMoveScore(tempIon,IN,lN,rN,colCats, stay = False)
+        moveScores[4,:] = self.computeMoveScore(tempIon,RIGHT,lN,rN,colCats, stay = False)
+        moveScores[5,:] = self.computeMoveScore(tempIon,LEFT,lN,rN,colCats, stay = False)
+        moveScores[6,:] = self.computeMoveScore(tempIon,EXTRA,lN,rN,colCats, stay = False)
+        moveScores[7,:] = self.computeMoveScore(tempIon,EXTRA2,lN,rN,colCats, stay = False)
+        moveScores[8,:] = self.computeMoveScore(tempIon,tempIonDest,lN,rN,colCats,stay = True)
+        if timeRun:
+            tcompMove1 = time.time()
+            print('Time to compute moveScores is')
+            print(tcompMove1-tcompMove0)
+        
+        cumProb = np.cumsum(moveScores/np.sum(moveScores, axis = 0),axis = 0)
+        
+        x = np.random.uniform(0,1,tempIon.shape[1])
+        
+        return UP*(x<=cumProb[0])+DOWN*((cumProb[0]<x) & (x<=cumProb[1]))+OUT*((cumProb[1]<x) & (x<=cumProb[2]))+\
+            IN*((cumProb[2]<x) & (x<=cumProb[3]))+\
+            RIGHT*((cumProb[3]<x) & (x<=cumProb[4]))+LEFT*((cumProb[4]<x)&(x<=cumProb[5]))+EXTRA*((cumProb[5]<x)&(x<=cumProb[6]))+\
+            EXTRA2*((cumProb[6]<x)& (x<=cumProb[7]))+tempIonDest*(cumProb[7]<x)
+
+    def newIon(self,timeRun = False):
+        if timeRun:
+            tnewion0 = time.time()
+        self.newionDU = np.array([])
+        self.newionLR = np.array([])
+        self.newionOI = np.array([])
+        if timeRun:
+            tnewion1 = time.time()
+            print('Time to initalize newion arrays is')
+            print(tnewion1-tnewion0)
+    
+    def moveIons(self,LeftN,RightN,show = False,timeIt = False):
+        #create array of random numbers of length ionDU (or ionOI, or ionLR, should all be equal)
+
+        if timeIt:
+            tfilter0 = time.time()
+        
+        willMove = np.random.uniform(size = len(self.ionDU))
+        #do moveFilter before computeJump, so we aren't unnecessarily computing jumps
+        #for like ~90% or more of ions
+        self.newionDU = np.concatenate((self.newionDU,self.ionDU[willMove>self.moveFilter]))
+        self.newionLR = np.concatenate((self.newionLR,self.ionLR[willMove>self.moveFilter]))
+        self.newionOI = np.concatenate((self.newionOI,self.ionOI[willMove>self.moveFilter]))
+        #tempionDU = self.ionDU[willMove<=self.moveFilter]
+        #tempionLR = self.ionLR[willMove<=self.moveFilter]
+        #tempionOI = self.ionOI[willMove<=self.moveFilter]
+        #or maybe bundle them together?
+        tempIon = np.vstack((self.ionDU[willMove<=self.moveFilter],self.ionLR[willMove<=self.moveFilter],
+                                 self.ionOI[willMove<=self.moveFilter]))
+
+        if timeIt:
+            tfilter1 = time.time()
+            print('Time to filter out the ions that will move')
+            print(tfilter1-tfilter0)
+              
+        if self.cellType == 'leftend':
+            #which, forDU, forLR, forOI = self.computeJump(tempIon,rN = RightN,show = show)
+            which = self.computeJump(tempIon,rN = RightN,show = show,timeRun = timeIt)
+        elif self.cellType == 'rightend':
+            #which, forDU, forLR, forOI = self.computeJump(tempIon,lN=LeftN,show = show)
+            which = self.computeJump(tempIon,lN=LeftN,show = show,timeRun = timeIt)
+        else:
+            #which, forDU, forLR, forOI = self.computeJump(tempIon,lN = LeftN, rN = RightN,show = show)
+            which = self.computeJump(tempIon,lN = LeftN, rN = RightN,show = show,timeRun=timeIt)
+
+        #this is where we count the number that go right across the junction this timestep
+        self.jumpJunct.append(((which[0,:]==-3) & (0<tempIon[0]) & (tempIon[0]<self.N[0]+1)\
+                               & (0<tempIon[2]) & (tempIon[2]<self.N[2]+1) & (which[2]==1)).sum())
+        self.enterMARG.append(((tempIon[0]==0) & (which[0]==-1) & (which[1] ==1) & (tempIon[1]!=0) & (tempIon[2]!=0) & (tempIon[2]!=self.N[2]+1)\
+                              &(tempIon[1] == which[2]) & (tempIon[2] == which[3])).sum()+\
+                              ((tempIon[0]==self.N[0]+1) & (which[0]==-1) & (which[1] ==self.N[0]) & (tempIon[1]!=0) & (tempIon[2]!=0) & (tempIon[2]!=self.N[2]+1)\
+                              &(tempIon[1] == which[2]) & (tempIon[2] == which[3])).sum()+\
+                              ((tempIon[2]==0) & (which[0]==-1) & (which[3] ==1) & (tempIon[1]!=0) & (tempIon[0]!=0) & (tempIon[0]!=self.N[0]+1)\
+                              &(tempIon[1] == which[2]) & (tempIon[0] == which[1])).sum()+\
+                              ((tempIon[2]==self.N[2]+1) & (which[0]==-1) & (which[3] ==self.N[2]) & (tempIon[1]!=0) & (tempIon[0]!=0) & (tempIon[0]!=self.N[0]+1)\
+                              &(tempIon[1] == which[2]) & (tempIon[0] == which[1])).sum())
+
+        self.enterGAPself.append(((tempIon[1] == 0) & (which[0] == -1) & (which[2] == 1) & (tempIon[0]!=0)\
+                                  &(tempIon[0]!=self.N[0]+1) & (tempIon[2]!=0) & (tempIon[2]!=self.N[2]+1)\
+                                  &(tempIon[0] == which[1]) & (tempIon[2] == which[3])).sum())
+
+        if self.cellType != 'leftend':
+            self.enterGAPleft.append(((tempIon[1] == 0) & (which[0] == -2) & (which[2] == LeftN.N[1]) & (tempIon[0]!=0)\
+                                     &(tempIon[0]!=self.N[0]+1) & (tempIon[2]!=0) & (tempIon[2]!=self.N[2]+1)\
+                                     &(tempIon[0] == which[1]) & (tempIon[2] == which[3])).sum())
+        
+        
+        self.newionDU = np.concatenate((self.newionDU,which[1,which[0,:]==-1]))
+        self.newionLR = np.concatenate((self.newionLR,which[2,which[0,:]==-1]))
+        self.newionOI = np.concatenate((self.newionOI,which[3,which[0,:]==-1]))
+
+        if self.cellType != 'leftend':
+            LeftN.newionDU = np.concatenate((LeftN.newionDU,which[1,which[0,:]==-2]))
+            LeftN.newionLR = np.concatenate((LeftN.newionLR,which[2,which[0,:]==-2]))
+            LeftN.newionOI = np.concatenate((LeftN.newionOI,which[3,which[0,:]==-2]))
+
+        if self.cellType !='rightend':
+            RightN.newionDU = np.concatenate((RightN.newionDU,which[1,which[0,:]==-3]))
+            RightN.newionLR = np.concatenate((RightN.newionLR,which[2,which[0,:]==-3]))
+            RightN.newionOI = np.concatenate((RightN.newionOI,which[3,which[0,:]==-3]))
+
+    #Do this once we have determined the move for each ion acrseloss all cells.
+    #Update ionI and ionJ with newionI and newionJ
+    def updateIon(self,timeRun = False):
+        if timeRun:
+            tupdateion0 = time.time()
+        self.ionDU = np.array(self.newionDU).astype(int)
+        self.ionLR = np.array(self.newionLR).astype(int)
+        self.ionOI = np.array(self.newionOI).astype(int)
+        if timeRun:
+            tupdateion1 = time.time()
+            print('Time to update ion arrays is')
+            print(tupdateion1-tupdateion0)
+
+    def checkBound(self,rightNbhr = 0):
+        #assumed that ionMat has been updated
+        #October 2,2024: Now have to assume that everyone's ionMat has been
+        #updated
+        #check the GAPs
+        counter = 0
+        #block number
+        bn = 2
+        #prev = self.pv_list.reverse()
+        #prevprev = self.pvpv_list.reverse()
+        for du in range(1,self.N[0]+1):
+            for oi in range(1,self.N[2]+1):
+                avg_1 = [self.ionMat[du+x,0,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                avg_2 = [self.ionMat[du+x,1,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                avg_3 = [self.ionMat[du+x,self.N[1],oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_1 = [self.ionMat[du+x,0,oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,0,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_2 = [self.ionMat[du+x,1,oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,1,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_3 = [self.ionMat[du+x,self.N[1],oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du, self.N[1],oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+
+                time_avg3 = np.median(avg_1)-np.median(avg_2)
+                self.current_list.append(time_avg3)
+                if(len(self.pvpv_list) > 1):
+                    time_avg1= self.pv_list[counter]
+                    time_avg2 = self.pvpv_list[counter]
+                    if np.median([time_avg1, time_avg2, time_avg3])<=self.GAP_Thresh:
+                        self.bndOpen[du,0,oi] = 1
+                counter +=1
+                if self.cellType == 'rightend':
+                    avg_4 = [self.ionMat[du+x,self.N[1] +1,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                    #avg_4 = [self.ionMat[du+x,self.N[1] +1, oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,self.N[1] +1,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                    time_avg3 = np.median(avg_4)-np.median(avg_3)
+                    self.current_list.append(time_avg3)
+                    if(len(self.pvpv_list) > 1):
+                        time_avg1= self.pvpv_list[counter]
+                        time_avg2 = self.pv_list[counter]
+                        if np.median([time_avg1, time_avg2, time_avg3])<=self.GAP_Thresh:
+                            self.bndOpen[du,self.N[1]+1,oi] = 1
+                else:
+                    avg_5 = [rightNbhr.ionMat[du + x,0,oi + z]for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                    #avg_5 = [rightNbhr.ionMat[du + x,0,oi]for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[rightNbhr.ionMat[du, 0, oi + z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]    
+                    time_avg3 = np.median(avg_5)-np.median(avg_3)
+                    self.current_list.append(time_avg3)
+                    if(len(self.pvpv_list) > 1):
+                        time_avg1= self.pvpv_list[counter]
+                        time_avg2 = self.pv_list[counter]
+                        if np.median([time_avg1, time_avg2, time_avg3])<=self.GAP_Thresh:
+                            self.bndOpen[du,self.N[1]+1,oi] = 1
+                counter +=1
+        #check MARGINs (up-down)
+        for lr in range(1,self.N[1]+1):
+            for oi in range(1,self.N[2]+1):
+                #if self.ionMat[du,0,oi]-self.ionMat[du,1,oi]<=self.GAP_Thresh: #look at
+                avg_1 = [self.ionMat[0,lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                avg_2 = [self.ionMat[1,lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                avg_3 = [self.ionMat[self.N[0],lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                avg_4 = [self.ionMat[self.N[0]+1,lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_1 = [self.ionMat[0,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))] +[self.ionMat[0,lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_2 = [self.ionMat[1,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[1,lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_3 = [self.ionMat[self.N[0],lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[self.N[0],lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                #avg_4 = [self.ionMat[self.N[0]+1,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[self.N[0],lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
+                
+                time_avg3 = np.median(avg_1)-np.median(avg_2)
+                self.current_list.append(time_avg3)
+                if(len(self.pvpv_list) > 1):
+                    time_avg1= self.pvpv_list[counter]
+                    time_avg2 = self.pv_list[counter]
+                    if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
+                        self.bndOpen[0,lr,oi] = 1
+                counter +=1
+
+                time_avg3 = np.median(avg_4)-np.median(avg_3)
+                self.current_list.append(time_avg3)
+                if(len(self.pvpv_list) > 1):
+                    time_avg1= self.pvpv_list[counter]
+                    time_avg2 = self.pv_list[counter]
+                    if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
+                        self.bndOpen[self.N[0]+1,lr,oi] = 1
+                counter +=1
+        #check MARGINs (out-in)
+        for du in range(1,self.N[0]+1):
+            for lr in range(1,self.N[1]+1):
+                #if self.ionMat[du,0,oi]-self.ionMat[du,1,oi]<=self.GAP_Thresh: #look at
+                avg_1 = [self.ionMat[du+x,lr+y,0] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                avg_2 = [self.ionMat[du+x,lr+y,1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                avg_3 = [self.ionMat[du+x,lr+y,self.N[2]] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                avg_4 = [self.ionMat[du+x,lr+y,self.N[2]+1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                #avg_1 = [self.ionMat[du,lr+y,0] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))] + [self.ionMat[du+x,lr,0] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                #avg_2 = [self.ionMat[du,lr+y,1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,1]  for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                #avg_3 = [self.ionMat[du,lr+y,self.N[2]] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,self.N[2]] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                #avg_4 = [self.ionMat[du,lr+y,self.N[2]+1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,self.N[2]+1] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
+                time_avg3 = np.median(avg_1)-np.median(avg_2)
+                self.current_list.append(time_avg3)
+                if(len(self.pvpv_list) > 1):
+                    time_avg1= self.pvpv_list[counter]
+                    time_avg2 = self.pv_list[counter]
+                    if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
+                        self.bndOpen[du,lr,0] = 1
+                counter +=1
+                time_avg3 = np.median(avg_4)-np.median(avg_3)
+                self.current_list.append(time_avg3)
+                if(len(self.pvpv_list) > 1):
+                    time_avg1= self.pvpv_list[counter]
+                    time_avg2 = self.pv_list[counter]
+                    if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
+                        self.bndOpen[du,lr,self.N[2]+1] = 1
+                counter +=1
+        self.pvpv_list = self.pv_list
+        self.pv_list = self.current_list
+        self.current_list = []
+        #print(counter)
+
+    def checkDepol(self):
+        self.counter += 1
+        if np.sum(self.bndOpen)>0 and self.depolar == 0 and self.cellType != 'leftend':
+            self.depolar = self.counter
+            print("depolar time:", self.depolar)
+            print("type:", self.cellType)
+#This is a component of the runModel function;
+#generally you won't have to explicitly call this yourself
+def doUpdateStep(cellModel,show,timeRun = False):
+    numMid = len(cellModel)-2
+    #Step One: Initialize placeholder for new ion positions
+    for i in cellModel:
+        i.newIon(timeRun = timeRun)
+    cellModel[0].moveIons(0,cellModel[1],show = show,timeIt = timeRun)
+    #Step Two: For each cell, move ions and store temporarily in placeholders
+    for middie in range(1,numMid+1):
+        cellModel[middie].moveIons(cellModel[middie-1], cellModel[middie+1],show = show,timeIt = timeRun)
+    cellModel[numMid+1].moveIons(cellModel[numMid],0,show = show,timeIt = timeRun)
+    #Step Three: Update ion positions from placeholders
+    for i in cellModel:
+        i.updateIon(timeRun = timeRun)
+    #Step Four: Get the ion count (don't have to change)
+    for cellie in range(len(cellModel)):
+        cellModel[cellie].getionCount()
+    #Step Five: Check to see if boundary is opening; depolarization (don't have to change)
+    for cellie in range(len(cellModel)):
+        if cellModel[cellie].cellType == 'rightend':
+            cellModel[cellie].checkBound()
+        else:
+            cellModel[cellie].checkBound(rightNbhr = cellModel[cellie+1]) 
+        cellModel[cellie].checkDepol()
+
+
+#C, N, G, ionThresh, openThresh, ionChans, gapJunct, moveFilter, NiGAP, NiMARG, pokeHoleMARG: as defined for Cell class
+#numCells: integer: the total number of cells (including ends) in the simulation
+
+def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 0.1, C = [25, 150, 25], N = [14, 84, 14],G = [0.133, 0.015, 0.133],moveFilter = 0.2,\
+               NiGAP = 800, NiMARG = 42000, pokeHoleMARG = False):
+    
+    theModel = [Cell(C, G, N, ionThresh, openThresh, 'leftend', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
+                     NiGAP = NiGAP, NiMARG = NiMARG,pokeHoleMARG = pokeHoleMARG)]\
+              +[Cell(C, G, N, ionThresh, openThresh, 'middle', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
+                    NiGAP = NiGAP, NiMARG = NiMARG) for yup in range(numCells-2)]\
+              +[Cell(C, G, N, ionThresh, openThresh, 'rightend', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
+                    NiGAP = NiGAP, NiMARG = NiMARG)]
+    return theModel 
+#This is a stripped down version of the runModel function that I used earlier; the previous version kept track of 
+# a lot of different metrics like at what timestep each region of the boundary opened, precisely when every block
+# in a cell contained ions, etc. Since we really don't use them anymore I've removed them. If necessary we can
+# go back to the old version.
+
+#theModel: model of cells, i.e. the output of createModel
+#extend: integer: number of timesteps to run once all the cells have depolarized
+def runModel(theModel,   extend = 0):
+    i = 0
+    depolArray = [cellie.depolar for cellie in theModel]
+    while(0 in depolArray[1:]):
+        #update the model
+        doUpdateStep(theModel,False)       
+        depolArray = [cellie.depolar for cellie in theModel]
+        i = i+1
+    for extras in range(extend):
+        #update the model
+        doUpdateStep(theModel,False)
+        i = i+1                    
+    print('This is the total number of rounds' +str(i))
+    return depolArray
+
+def showSpecs(cellNum,cellOI, bndTimeMat,ionCountMat):
+    print('For Cell Number '+str(cellNum))
+    print('Here are the boundary opening times:')
+    for i in range(cellOI+2):
+        print(np.transpose(bndTimeMat[:,:,i]))
+    print('Here is the ion count:')
+    for i in range(cellOI+2):
+        print(np.transpose(ionCountMat[:,:,i]))
