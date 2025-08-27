@@ -46,8 +46,8 @@ import os.path
 
 class Cell:
  
-    def __init__(self,C, G, N, ionThresh, openThresh, cellType, ionChans, gapJunct = 1, NiGAP = 80, NiMARG = 4200,\
-                moveFilter = 0.2, pokeHoleMARG = False):
+    def __init__(self,C, G, N, ionThresh, openThresh, cellType, ionChans, gapJunct = 0.1, NiGAP = 800, NiMARG = 42000,\
+                moveFilter = 0.25, pokeHoleMARG = False):
 
         self.C = C
         self.G = G
@@ -739,8 +739,8 @@ def doUpdateStep(cellModel,show,timeRun = False):
 #C, N, G, ionThresh, openThresh, ionChans, gapJunct, moveFilter, NiGAP, NiMARG, pokeHoleMARG: as defined for Cell class
 #numCells: integer: the total number of cells (including ends) in the simulation
 
-def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 1, C = [25, 150,25], N = [2,12,2],G = [0.133, 0.015, 0.133],moveFilter = 0.01,\
-               NiGAP = 80, NiMARG = 4200, pokeHoleMARG = False):
+def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 0.1, C = [25, 150,25], N = [2,12,2],G = [0.133, 0.015, 0.133],moveFilter = 0.25,\
+               NiGAP = 800, NiMARG = 42000, pokeHoleMARG = False):
     
     theModel = [Cell(C, G, N, ionThresh, openThresh, 'leftend', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
                      NiGAP = NiGAP, NiMARG = NiMARG,pokeHoleMARG = pokeHoleMARG)]\
