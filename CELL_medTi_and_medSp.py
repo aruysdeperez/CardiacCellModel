@@ -37,10 +37,6 @@ import os.path
 
 #moveFilter: number between 0 and 1: represents the expected number of ions that we will choose to move
 #      each timestep
-#      cell boundary in the leftmost cell; if False it will be in the GAP, if True in the MARG; generally
-#      the only time we set this to be True is when ionChans[0] = 0, that is there are no ion channels
-#      on a face of the cell boundary facing a GAP block (since then opening the boundary there does nothing
-#      as ions still can't cross over)
 
 #pokeHoleMARG: Boolean: determines where to start the depolarization process by opening a region of the
 #      cell boundary in the leftmost cell; if False it will be in the GAP, if True in the MARG; generally
@@ -50,7 +46,7 @@ import os.path
 
 class Cell:
  
-    def __init__(self,C, G, N, ionThresh, openThresh, cellType, ionChans, gapJunct = 0.1, NiGAP = 800, NiMARG = 42000,\
+    def __init__(self,C, G, N, ionThresh, openThresh, cellType, ionChans, gapJunct = 1, NiGAP = 80, NiMARG = 4200,\
                 moveFilter = 0.2, pokeHoleMARG = False):
 
         self.C = C
@@ -95,19 +91,11 @@ class Cell:
         self.CellCellchanCoeff = gapJunct
 
         #the order of the destination square in each list is: STAY, INTRA, MARG, GAP
-        #self.INTRA = np.array([self.computeStay(self.INTRA_VOL,self.INTRA_SA),self.DimINTRA[0]*self.DimINTRA[1],0,0])
-        #self.GAP = np.array([self.computeStay(self.GAP_VOL,self.GAP_SA),self.DimGAP[0]*self.DimGAP[2],\
-                            #self.DimGAP[0]*self.DimGAP[1], self.DimGAP[0]*self.DimGAP[1]])
-        #self.MARG = np.array([self.computeStay(self.MARG_VOL,self.MARG_SA),self.DimMARG[1]*self.DimMARG[2],\
-                            #self.DimMARG[0]*self.DimMARG[1],self.DimGAP[1]*self.DimGAP[2]])
-
-        self.INTRA = np.array([self.computeStay(self.INTRA_VOL,self.INTRA_SA),(self.DimINTRA[0]*self.DimINTRA[1])/self.INTRA_SA,0,0])
-
-        self.GAP = np.array([self.computeStay(self.GAP_VOL,self.GAP_SA),(self.DimGAP[0]*self.DimGAP[2])/self.GAP_SA,\
-                            (self.DimGAP[0]*self.DimGAP[1])/self.GAP_SA, (self.DimGAP[0]*self.DimGAP[1])/self.GAP_SA])
-
-        self.MARG = np.array([self.computeStay(self.MARG_VOL,self.MARG_SA),(self.DimMARG[1]*self.DimMARG[2])/self.MARG_SA,\
-                            (self.DimMARG[0]*self.DimMARG[1])/self.MARG_SA,(self.DimGAP[1]*self.DimGAP[2])/self.MARG_SA])
+        self.INTRA = np.array([self.computeStay(self.INTRA_VOL,self.INTRA_SA),self.DimINTRA[0]*self.DimINTRA[1],0,0])
+        self.GAP = np.array([self.computeStay(self.GAP_VOL,self.GAP_SA),self.DimGAP[0]*self.DimGAP[2],\
+                            self.DimGAP[0]*self.DimGAP[1], self.DimGAP[0]*self.DimGAP[1]])
+        self.MARG = np.array([self.computeStay(self.MARG_VOL,self.MARG_SA),self.DimMARG[1]*self.DimMARG[2],\
+                            self.DimMARG[0]*self.DimMARG[1],self.DimGAP[1]*self.DimGAP[2]])
         
         self.NiGAP = NiGAP
         self.NiMARG = NiMARG
@@ -240,7 +228,6 @@ class Cell:
         elif (currOI==0 or currOI==self.N[2]+1) and  currDU>=1 and currDU<=self.N[0] and currLR>=1 and currLR<=self.N[1]:
             return -2
         elif currDU>=1 and currLR>=1 and currOI>=1 and currDU<=self.N[0] and currLR<=self.N[1] and currOI<=self.N[2]:
-
             return -3
         else:
             print('Invalid square for ion: ('+ str(currI)+', '+str(currJ)+')')
@@ -429,7 +416,7 @@ class Cell:
         return np.array(UP), np.array(DOWN), np.array(IN), np.array(OUT), np.array(RIGHT), np.array(LEFT),\
             np.array(EXTRA), np.array(EXTRA2)
                     
-    #March 5, 2025: optimize; make it so that the inputs are as follows: esp play with 
+    #March 5, 2025: optimize; make it so that the inputs are as follows:
     def computeMoveScore(self, current, destination,lN,rN,colCats,stay):
         
         if self.cellType == 'leftend':
@@ -478,7 +465,7 @@ class Cell:
             (currSquare == -1)*self.GAP[destSquare]+\
             (currSquare == -3)*self.INTRA[destSquare]
         
-        return (destination[0]!=-4)*chanCoef*csCoef/(1+np.exp(((ionCount**3)/np.sqrt(destVol))-self.ionThresh))
+        return (destination[0]!=-4)*chanCoef*csCoef/(1+np.exp((ionCount/np.sqrt(destVol))-self.ionThresh))
         #return csCoef/(1+np.exp(ionCount-self.ionThresh))
 
     def computeJump(self,tempIon, lN =0, rN = 0,show = False,timeRun = False):
@@ -625,18 +612,14 @@ class Cell:
         #updated
         #check the GAPs
         counter = 0
-        #block number
-        bn = 2
-        #prev = self.pv_list.reverse()
-        #prevprev = self.pvpv_list.reverse()
+        
         for du in range(1,self.N[0]+1):
             for oi in range(1,self.N[2]+1):
+                #block number
+                bn = 2 
                 avg_1 = [self.ionMat[du+x,0,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_2 = [self.ionMat[du+x,1,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_3 = [self.ionMat[du+x,self.N[1],oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_1 = [self.ionMat[du+x,0,oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,0,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_2 = [self.ionMat[du+x,1,oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,1,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_3 = [self.ionMat[du+x,self.N[1],oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du, self.N[1],oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
 
                 time_avg3 = np.median(avg_1)-np.median(avg_2)
                 self.current_list.append(time_avg3)
@@ -648,7 +631,6 @@ class Cell:
                 counter +=1
                 if self.cellType == 'rightend':
                     avg_4 = [self.ionMat[du+x,self.N[1] +1,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                    #avg_4 = [self.ionMat[du+x,self.N[1] +1, oi] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[self.ionMat[du,self.N[1] +1,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                     time_avg3 = np.median(avg_4)-np.median(avg_3)
                     self.current_list.append(time_avg3)
                     if(len(self.pvpv_list) > 1):
@@ -658,7 +640,7 @@ class Cell:
                             self.bndOpen[du,self.N[1]+1,oi] = 1
                 else:
                     avg_5 = [rightNbhr.ionMat[du + x,0,oi + z]for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                    #avg_5 = [rightNbhr.ionMat[du + x,0,oi]for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du))]+[rightNbhr.ionMat[du, 0, oi + z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]    
+                        
                     time_avg3 = np.median(avg_5)-np.median(avg_3)
                     self.current_list.append(time_avg3)
                     if(len(self.pvpv_list) > 1):
@@ -675,10 +657,6 @@ class Cell:
                 avg_2 = [self.ionMat[1,lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_3 = [self.ionMat[self.N[0],lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_4 = [self.ionMat[self.N[0]+1,lr+y,oi+z] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_1 = [self.ionMat[0,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))] +[self.ionMat[0,lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_2 = [self.ionMat[1,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[1,lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_3 = [self.ionMat[self.N[0],lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[self.N[0],lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
-                #avg_4 = [self.ionMat[self.N[0]+1,lr+y,oi] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[self.N[0],lr,oi+z] for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 
                 time_avg3 = np.median(avg_1)-np.median(avg_2)
                 self.current_list.append(time_avg3)
@@ -705,18 +683,13 @@ class Cell:
                 avg_2 = [self.ionMat[du+x,lr+y,1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
                 avg_3 = [self.ionMat[du+x,lr+y,self.N[2]] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
                 avg_4 = [self.ionMat[du+x,lr+y,self.N[2]+1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr)) for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
-                #avg_1 = [self.ionMat[du,lr+y,0] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))] + [self.ionMat[du+x,lr,0] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
-                #avg_2 = [self.ionMat[du,lr+y,1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,1]  for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
-                #avg_3 = [self.ionMat[du,lr+y,self.N[2]] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,self.N[2]] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
-                #avg_4 = [self.ionMat[du,lr+y,self.N[2]+1] for y in range(-1*min(bn, lr-1), min(bn+1, N[1]+1 - lr))]+[self.ionMat[du+x,lr,self.N[2]+1] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1-du))]
                 time_avg3 = np.median(avg_1)-np.median(avg_2)
                 self.current_list.append(time_avg3)
                 if(len(self.pvpv_list) > 1):
                     time_avg1= self.pvpv_list[counter]
                     time_avg2 = self.pv_list[counter]
                     if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
-                        self.bndOpen[du,lr,0] = 1
-                counter +=1
+                        self.bndOpen[0, lr, oi] = 1
                 time_avg3 = np.median(avg_4)-np.median(avg_3)
                 self.current_list.append(time_avg3)
                 if(len(self.pvpv_list) > 1):
@@ -728,14 +701,12 @@ class Cell:
         self.pvpv_list = self.pv_list
         self.pv_list = self.current_list
         self.current_list = []
-        #print(counter)
 
     def checkDepol(self):
         self.counter += 1
         if np.sum(self.bndOpen)>0 and self.depolar == 0 and self.cellType != 'leftend':
             self.depolar = self.counter
-            print("depolar time:", self.depolar)
-            print("type:", self.cellType)
+
 #This is a component of the runModel function;
 #generally you won't have to explicitly call this yourself
 def doUpdateStep(cellModel,show,timeRun = False):
@@ -766,8 +737,8 @@ def doUpdateStep(cellModel,show,timeRun = False):
 #C, N, G, ionThresh, openThresh, ionChans, gapJunct, moveFilter, NiGAP, NiMARG, pokeHoleMARG: as defined for Cell class
 #numCells: integer: the total number of cells (including ends) in the simulation
 
-def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 0.1, C = [25, 150, 25], N = [14, 84, 14],G = [0.133, 0.015, 0.133],moveFilter = 0.2,\
-               NiGAP = 800, NiMARG = 42000, pokeHoleMARG = False):
+def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 1, C = [25, 150,25], N = [2,12,2],G = [0.133, 0.015, 0.133],moveFilter = 0.01,\
+               NiGAP = 80, NiMARG = 4200, pokeHoleMARG = False):
     
     theModel = [Cell(C, G, N, ionThresh, openThresh, 'leftend', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
                      NiGAP = NiGAP, NiMARG = NiMARG,pokeHoleMARG = pokeHoleMARG)]\
@@ -776,6 +747,7 @@ def createModel(numCells, ionThresh, openThresh, ionChans, gapJunct = 0.1, C = [
               +[Cell(C, G, N, ionThresh, openThresh, 'rightend', ionChans, gapJunct = gapJunct, moveFilter = moveFilter,\
                     NiGAP = NiGAP, NiMARG = NiMARG)]
     return theModel 
+
 #This is a stripped down version of the runModel function that I used earlier; the previous version kept track of 
 # a lot of different metrics like at what timestep each region of the boundary opened, precisely when every block
 # in a cell contained ions, etc. Since we really don't use them anymore I've removed them. If necessary we can
@@ -796,13 +768,4 @@ def runModel(theModel,   extend = 0):
         doUpdateStep(theModel,False)
         i = i+1                    
     print('This is the total number of rounds' +str(i))
-    return depolArray
-
-def showSpecs(cellNum,cellOI, bndTimeMat,ionCountMat):
-    print('For Cell Number '+str(cellNum))
-    print('Here are the boundary opening times:')
-    for i in range(cellOI+2):
-        print(np.transpose(bndTimeMat[:,:,i]))
-    print('Here is the ion count:')
-    for i in range(cellOI+2):
-        print(np.transpose(ionCountMat[:,:,i]))
+    return depolArray        
