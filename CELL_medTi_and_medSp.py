@@ -112,7 +112,7 @@ class Cell:
         self.GAP_Thresh = openThresh[0]
         self.MARG_Thresh = openThresh[1]
 
-        #new variable lists
+        #August 2025: new variable lists
         self.current_list = []
         self.pv_list = []
         self.pvpv_list = []
@@ -464,8 +464,9 @@ class Cell:
         csCoef = (currSquare == -2)*self.MARG[destSquare]+\
             (currSquare == -1)*self.GAP[destSquare]+\
             (currSquare == -3)*self.INTRA[destSquare]
-        
-        return (destination[0]!=-4)*chanCoef*csCoef/(1+np.exp((ionCount/np.sqrt(destVol))-self.ionThresh))
+
+        #August 2025: ionCount squared to reduce time constraint
+        return (destination[0]!=-4)*chanCoef*csCoef/(1+np.exp(((ionCount)**2/np.sqrt(destVol))-self.ionThresh))
         #return csCoef/(1+np.exp(ionCount-self.ionThresh))
 
     def computeJump(self,tempIon, lN =0, rN = 0,show = False,timeRun = False):
@@ -609,7 +610,7 @@ class Cell:
     def checkBound(self,rightNbhr = 0):
         #assumed that ionMat has been updated
         #October 2,2024: Now have to assume that everyone's ionMat has been
-        #updated
+        #August 2025: updated to use median values for time and space
         #check the GAPs
         counter = 0
         
