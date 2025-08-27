@@ -690,7 +690,7 @@ class Cell:
                     time_avg1= self.pvpv_list[counter]
                     time_avg2 = self.pv_list[counter]
                     if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
-                        self.bndOpen[0, lr, oi] = 1
+                        self.bndOpen[du, lr, 0] = 1
                 counter +=1
                 time_avg3 = np.median(avg_4)-np.median(avg_3)
                 self.current_list.append(time_avg3)
