@@ -613,11 +613,11 @@ class Cell:
         #August 2025: updated to use median values for time and space
         #check the GAPs
         counter = 0
-        
+
+        #bn: Bound number, number of blocks in each direction whose number of ions are averaged
+        bn = 2
         for du in range(1,self.N[0]+1):
             for oi in range(1,self.N[2]+1):
-                #block number
-                bn = 2 
                 avg_1 = [self.ionMat[du+x,0,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_2 = [self.ionMat[du+x,1,oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
                 avg_3 = [self.ionMat[du+x,self.N[1],oi+z] for x in range(-1*min(bn, du-1), min(bn+1, N[0]+1 - du)) for z in range(-1*min(bn, oi-1), min(bn+1, N[2]+1-oi))]
@@ -691,6 +691,7 @@ class Cell:
                     time_avg2 = self.pv_list[counter]
                     if np.median([time_avg1, time_avg2, time_avg3])<=self.MARG_Thresh:
                         self.bndOpen[0, lr, oi] = 1
+                counter +=1
                 time_avg3 = np.median(avg_4)-np.median(avg_3)
                 self.current_list.append(time_avg3)
                 if(len(self.pvpv_list) > 1):
